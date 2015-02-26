@@ -24,5 +24,6 @@ if settings.SPA_ENABLE_URLS:
         url(r'^mozpay/v1/api/', include('webpay.api.urls', namespace='api'))
     )
 
-# Ensure that 403 is routed through a view.
 handler403 = 'webpay.auth.views.denied'
+handler404 = 'webpay.auth.views.missing'
+handler500 = 'webpay.auth.views.error'

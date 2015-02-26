@@ -120,6 +120,14 @@ def denied(request):
     return render(request, '403.html', status=403)
 
 
+def missing(request):
+    return render(request, '404.html', status=404)
+
+
+def error(request):
+    return render(request, '500.html', status=500)
+
+
 def get_audience(request):
     if settings.DEV:
         # This is insecure but convenient.

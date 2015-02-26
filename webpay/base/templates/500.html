@@ -1,7 +1,6 @@
 {% extends "base_error.html" %}
-{% block error_title %}{{ _('Something went wrong!') }}{% endblock %}
-{% block error_heading %}{{ _('Something went wrong!') }}{% endblock %}
+{% block error_title %}{{ _('Server Error') }}{% endblock %}
+{% block error_heading %}{{ _('Server Error') }}{% endblock %}
 {% block error_content -%}
-    <p>{{ _('There was an error processing that request.') }}</p>
-    <p>{{ _('Please try again in a few moments.') }}</p>
+    <p>{{ _('Something terrible occurred.') }}</p>
 {% endblock %}
