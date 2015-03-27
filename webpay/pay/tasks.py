@@ -12,7 +12,7 @@ from celeryutils import task
 import jwt
 from lib.marketplace.api import client as mkt_client, UnknownPricePoint
 from lib.solitude import constants
-from lib.solitude.api import client, ProviderHelper
+from lib.solitude.api import client, ProviderHelper, Transaction
 from multidb.pinning import use_master
 
 from webpay.base import dev_messages
@@ -147,8 +147,10 @@ def get_secret(issuer_key):
                       .get_object_or_404(public_id=issuer_key))['secret']
 
 
-def get_provider_seller_uuid(issuer_key, product_data, provider_names):
-    """Resolve the JWT into a seller uuid."""
+def get_product_seller(issuer_key, product_data):
+    """
+    Resolve the JWT into a seller and product.
+    """
     if is_marketplace(issuer_key):
         # The issuer of the JWT is Firefox Marketplace.
         # This is a special case where we need to find the
@@ -174,26 +176,50 @@ def get_provider_seller_uuid(issuer_key, product_data, provider_names):
         public_id=public_id)
     seller = (client.slumber.generic.seller(uri_to_pk(product['seller']))
               .get_object_or_404())
-    generic_seller_uuid = seller['uuid']
+    log.info('Got product {0} and seller {1}'.format(product, seller))
+    return product, seller
 
+
+def get_provider(product, provider_names):
+    """Choose a provider."""
     for provider in provider_names:
         if product['seller_uuids'].get(provider, None) is not None:
             provider_seller_uuid = product['seller_uuids'][provider]
-            log.info('Using provider seller uuid {s} for provider '
-                     '{p} and for public_id {i}, generic seller uuid {u}'
-                     .format(s=provider_seller_uuid, u=generic_seller_uuid,
-                             p=provider, i=public_id))
-            return (ProviderHelper(provider), provider_seller_uuid,
-                    generic_seller_uuid)
+            log.info('Using provider seller uuid: {s} for provider: {p}'
+                     .format(s=provider_seller_uuid, p=provider))
+            return ProviderHelper(provider, provider_seller_uuid)
 
     raise ValueError(
-        'Unable to find a valid seller_uuid for public_id {public_id} '
-        'using providers: {providers}'.format(
-            public_id=public_id, providers=provider_names))
+        'Unable to find a valid provider using providers: {0}'
+        .format(provider_names))
+
+
+def get_buyer(self, user_uuid):
+    try:
+        return self.slumber.generic.buyer.get_object_or_404(
+            uuid=user_uuid)
+    except ObjectDoesNotExist:
+        raise BuyerNotConfigured(
+            'Buyer with uuid {u} does not exist'
+            .format(u=user_uuid))
 
 
 def is_marketplace(issuer_key):
     return issuer_key == settings.KEY
+
+
+def get_application_size(product_data):
+    try:
+        return int(product_data['application_size'][0])
+    except (KeyError, ValueError):
+        pass
+
+
+def log_exception(msg, exc):
+    log.exception('{msg} {t}: {exc.__class__.__name__}: {exc}'
+                  .format(msg=msg, t=transaction, exc=exc))
+    etype, val, tb = sys.exc_info()
+    raise exc, None, tb
 
 
 @task
@@ -227,59 +253,87 @@ def start_pay(transaction_uuid, notes, user_uuid, provider_names, **kw):
     pay = notes['pay_request']
     network = notes.get('network', {})
     product_data = urlparse.parse_qs(pay['request'].get('productData', ''))
-    try:
-        (provider_helper,
-         provider_seller_uuid,
-         generic_seller_uuid) = get_provider_seller_uuid(key,
-                                                         product_data,
-                                                         provider_names)
-        try:
-            application_size = int(product_data['application_size'][0])
-        except (KeyError, ValueError):
-            application_size = None
 
+    transaction = Transaction(transaction_uuid)
+
+    # This could go wrong, but more information would need to be relaxed in
+    # solitude before we could write a transaction with this little
+    # informaation.
+    buyer = get_buyer(user_uuid)
+
+    # TODO: make sense of this. This looks up product based on the public_id
+    # from the JWT.
+    product, seller = get_product_seller(key, product_data)
+    try:
+        # Figure out the smallest amount of data we need to start a
+        # transaction before getting into other things.
+        transaction.init(
+            buyer=buyer['resource_uri'],
+            seller=seller['resource_uri'],
+            seller_product=None,
+            generic_seller_uuid=seller['uuid'],
+            source='marketplace' if is_marketplace(key) else 'other',
+            user_uuid=user_uuid,
+            mcc=network.get('mcc'),
+            mnc=network.get('mnc'),
+            notes=json.dumps(notes),
+            type=constants.TYPE_PAYMENT,
+        )
+    except Exception, exc:
+        log.exception('while initializing payment', exc)
+
+    # This failing is ok and the get_icon_url has suitable failure code.
+    # Will return None if it fails.
+    icon_url = get_icon_url(pay['request'])
+    log.info('icon URL for %s: %s' % (transaction_uuid, icon_url))
+
+    # Figure out the provider.
+    try:
+        provider_helper = get_provider(product_data, provider_names)
+    except Exception, exc:
+        transaction.fail(reason='PROVIDER_LOOKUP')
+        log.exception('while looking up provider', exc)
+
+    # Update the transaction in solitude with the new information.
+    transaction.update(
+        icon_url=icon_url,
+        provider=constants.PROVIDERS[provider_helper.name],
+    )
+
+    try:
         # Ask the marketplace for a valid price point.
         # Note: the get_price_country API might be more helpful.
         prices = mkt_client.get_price(pay['request']['pricePoint'],
                                       provider=provider_helper.provider.name)
         log.debug('pricePoint=%s prices=%s' % (pay['request']['pricePoint'],
                                                prices['prices']))
-        try:
-            icon_url = (get_icon_url(pay['request'])
-                        if settings.USE_PRODUCT_ICONS else None)
-        except:
-            log.exception('Calling get_icon_url')
-            icon_url = None
-        log.info('icon URL for %s: %s' % (transaction_uuid, icon_url))
-
-        bill_id, pay_url, seller_id = provider_helper.start_transaction(
-            transaction_uuid=transaction_uuid,
-            generic_seller_uuid=generic_seller_uuid,
-            provider_seller_uuid=provider_seller_uuid,
-            product_id=pay['request']['id'],
-            product_name=pay['request']['name'],
-            prices=prices['prices'],
-            icon_url=icon_url,
-            user_uuid=user_uuid,
-            application_size=application_size,
-            source='marketplace' if is_marketplace(key) else 'other',
-            mcc=network.get('mcc'),
-            mnc=network.get('mnc')
-        )
-        trans_pk = client.slumber.generic.transaction.get_object(
-            uuid=transaction_uuid)['resource_pk']
-        client.slumber.generic.transaction(trans_pk).patch({
-            'notes': json.dumps(notes),
-            'uid_pay': bill_id,
-            'pay_url': pay_url,
-            'status': constants.STATUS_PENDING
-        })
     except Exception, exc:
-        log.exception('while configuring payment for transaction {t}: '
-                      '{exc.__class__.__name__}: {exc}'
-                      .format(t=transaction_uuid, exc=exc))
-        etype, val, tb = sys.exc_info()
-        raise exc, None, tb
+        transaction.fail(reason='PRICE_LOOKUP')
+        log.exception('while looking up price', exc)
+
+
+    #
+    # Create the transaction with the payment provider (as distinct from
+    # solitude).
+    try:
+        bill_id, pay_url, seller_id = provider_helper.create_transaction(
+            application_size=get_application_size(product_data),
+            icon_url=icon_url,
+            prices=prices,
+            product_name=pay['request']['name'],
+            provider_product_uri=provider_product['resource_uri'],
+            transaction_uuid=transaction_uuid,
+            user_uuid=user_uuid
+        )
+    except Exception, exc:
+        transaction.fail(reason='TRANSACTION_CONFIGURATION')
+        log.exception('while configuring transaction', exc)
+
+    # Update the transaction in solitude.
+    transaction.update(
+        status=constants.STATUS_PENDING,
+        uid_pay=bill_id,
+    )
 
 
 @task(**notify_kw)
@@ -401,6 +455,9 @@ def get_icon_url(request):
 
     A cached URL will be returned on succes or None if it doesn't exist yet.
     """
+    if not settings.USE_PRODUCT_ICONS:
+        return
+
     icons = request.get('icons')
     if not icons:
         return None

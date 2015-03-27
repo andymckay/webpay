@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 import uuid
 import warnings
 
@@ -13,6 +14,7 @@ from mpconstants import countries
 from slumber.exceptions import HttpClientError
 
 from lib.marketplace.constants import COUNTRIES
+from lib.solitude.constants import STATUS_ERRORED, STATUS_STARTED
 from webpay.base import dev_messages as msg
 from webpay.base.helpers import absolutify
 
@@ -215,11 +217,13 @@ class ProviderHelper:
     """
     A common interface to all payment providers.
     """
-    def __init__(self, name, slumber=None):
+    def __init__(self, name, slumber=None, seller_uuid=None):
         self.slumber = slumber or client.slumber
         ProviderClass = provider_cls(name)
         self.provider = ProviderClass(self.slumber)
         self.name = self.provider.name
+        self.seller_uuid = seller_uuid
+        self.transaction = None
 
     @classmethod
     def supported_providers(cls, mcc=None, mnc=None):
@@ -253,39 +257,7 @@ class ProviderHelper:
 
         return [cls(provider_name) for provider_name in supported_providers]
 
-    def start_transaction(self, transaction_uuid,
-                          generic_seller_uuid, provider_seller_uuid,
-                          product_id, product_name,
-                          prices, icon_url,
-                          user_uuid, application_size,
-                          source='unknown',
-                          mcc=None, mnc=None):
-        """
-        Start a payment provider transaction to begin the purchase flow.
-        """
-        try:
-            generic_buyer = self.slumber.generic.buyer.get_object_or_404(
-                uuid=user_uuid)
-        except ObjectDoesNotExist:
-            raise BuyerNotConfigured(
-                '{pr}: Buyer with uuid {u} does not exist'
-                .format(u=user_uuid, pr=self.provider.name))
-
-        try:
-            generic_seller = self.slumber.generic.seller.get_object_or_404(
-                uuid=generic_seller_uuid)
-        except ObjectDoesNotExist:
-            raise SellerNotConfigured(
-                '{pr}: Seller with uuid {u} does not exist'
-                .format(u=generic_seller_uuid, pr=self.provider.name))
-        generic_seller_id = generic_seller['resource_pk']
-        log.info('{pr}: starting transaction {tr}: generic seller: {sel}'
-                 .format(tr=transaction_uuid, sel=generic_seller_id,
-                         pr=self.provider.name))
-        log.info('{pr}: get product for seller_uuid={uuid} external_id={ext}'
-                 .format(pr=self.provider.name,
-                         uuid=generic_seller_uuid, ext=product_id))
-
+    def get_product(self, product_id, generic_seller):
         product = None
         try:
             product = self.slumber.generic.product.get_object_or_404(
@@ -304,26 +276,8 @@ class ProviderHelper:
                 generic_seller=generic_seller, generic_product=product,
                 provider_seller_uuid=provider_seller_uuid)
 
-        trans_token, pay_url = self.provider.create_transaction(
-            generic_buyer=generic_buyer,
-            generic_seller=generic_seller,
-            generic_product=product,
-            provider_product=provider_product,
-            provider_seller_uuid=provider_seller_uuid,
-            product_name=product_name,
-            transaction_uuid=transaction_uuid,
-            prices=prices,
-            user_uuid=user_uuid,
-            application_size=application_size,
-            source=source,
-            icon_url=icon_url,
-            mcc=mcc,
-            mnc=mnc,
-        )
-        log.info('{pr}: made provider trans {trans}'
-                 .format(trans=trans_token, pr=self.provider.name))
+        return product, provider_product
 
-        return trans_token, pay_url, generic_seller_id
 
     def create_product(self, external_id, product_name, generic_seller,
                        provider_seller_uuid, generic_product=None):
@@ -628,9 +582,6 @@ class ReferenceProvider(PayProvider):
         # but I can't tell if we need that or not. Let's wait until it breaks.
         # See solitude/lib/transactions/models.py
         trans = self.slumber.generic.transaction.post({
-            'uuid': transaction_uuid,
-            'status': solitude_const.STATUS_PENDING,
-            'provider': solitude_const.PROVIDERS[self.name],
             'buyer': generic_buyer['resource_uri'],
             'seller': generic_seller['resource_uri'],
             'seller_product': generic_product['resource_uri'],
@@ -685,12 +636,9 @@ class BokuProvider(PayProvider):
         # Boku does not have a products API the way Bango does.
         return None
 
-    def create_transaction(self, generic_buyer,
-                           generic_seller, generic_product,
-                           provider_product, provider_seller_uuid,
-                           product_name, transaction_uuid,
-                           prices, user_uuid, application_size, source,
-                           icon_url, mcc=None, mnc=None):
+    def create_transaction(self, application_size, icon_url,
+                           prices, product_name, provider_seller_uuid, source,
+                           transaction_uuid, user_uuid, mcc=None, mnc=None):
         try:
             # Do a sanity check to make sure we're actually on a Boku network.
             self.network_data[(mcc, mnc)]
@@ -732,20 +680,6 @@ class BokuProvider(PayProvider):
         })
         log.info('{pr}: made provider trans {trans}'
                  .format(pr=self.name, trans=provider_trans))
-
-        trans = self.slumber.generic.transaction.post({
-            'provider': solitude_const.PROVIDERS[self.name],
-            'buyer': generic_buyer['resource_uri'],
-            'seller': generic_seller['resource_uri'],
-            'seller_product': generic_product['resource_uri'],
-            'source': source,
-            'status': solitude_const.STATUS_PENDING,
-            'type': solitude_const.TYPE_PAYMENT,
-            'uuid': transaction_uuid,
-        })
-        log.info('{pr}: made solitude trans {trans}'
-                 .format(pr=self.name, trans=trans))
-
         return provider_trans['transaction_id'], provider_trans['buy_url']
 
     def get_notification_data(self, request):
@@ -834,15 +768,12 @@ class BangoProvider(PayProvider):
                 .format(sel=provider_generic_seller['resource_pk']))
         return provider_generic_seller['bango']
 
-    def create_transaction(self, generic_buyer,
-                           generic_seller, generic_product,
-                           provider_product, provider_seller_uuid,
-                           product_name, transaction_uuid,
-                           prices, user_uuid, application_size, source,
-                           icon_url, mcc=None, mnc=None):
+    def create_transaction(self, application_size, icon_url, prices,
+                           product_name, provider_product_uri,
+                           transaction_uuid, user_uuid):
         log.info('transaction {tr}: bango product: {pr}'
                  .format(tr=transaction_uuid,
-                         pr=provider_product['resource_uri']))
+                         pr=provider_product_uri))
 
         redirect_url_onsuccess = absolutify(reverse('bango.success'))
         redirect_url_onerror = absolutify(reverse('bango.error'))
@@ -851,13 +782,12 @@ class BangoProvider(PayProvider):
             'pageTitle': product_name,
             'prices': prices,
             'transaction_uuid': transaction_uuid,
-            'seller_product_bango': provider_product['resource_uri'],
+            'seller_product_bango': provider_product_uri,
             'redirect_url_onsuccess': redirect_url_onsuccess,
             'redirect_url_onerror': redirect_url_onerror,
             'icon_url': icon_url,
             'user_uuid': user_uuid,
-            'application_size': application_size,
-            'source': source
+            'application_size': application_size
         })
 
         bill_id = res['billingConfigurationId']
@@ -865,25 +795,61 @@ class BangoProvider(PayProvider):
                  'transaction {tr}; prices: {prices}'
                  .format(tr=transaction_uuid, bill=bill_id, prices=prices,
                          pr=self.name))
-
-        trans = self.slumber.generic.transaction.post({
-            'provider': solitude_const.PROVIDERS[self.name],
-            'buyer': generic_buyer['resource_uri'],
-            'seller': generic_seller['resource_uri'],
-            'seller_product': generic_product['resource_uri'],
-            'source': source,
-            'status': solitude_const.STATUS_PENDING,
-            'type': solitude_const.TYPE_PAYMENT,
-            'uuid': transaction_uuid,
-            'uid_pay': bill_id
-        })
-        log.info('{pr}: made solitude trans {trans}'
-                 .format(pr=self.name, trans=trans))
-
         return bill_id, self._formatted_payment_url(bill_id)
 
     def transaction_from_notice(self, parsed_qs):
         raise NotImplementedError()
+
+
+class Transaction(object):
+    """
+    This is a wrapper around the solitude generic transaction
+    object to make working with transactions easier.
+    """
+
+    @property
+    def api(self):
+        return self.slumber.generic.transaction
+
+    def __init__(self, uuid, slumber):
+        self.uuid = uuid
+        self.slumber = slumber
+        self.pk = None
+
+    def __repr__(self):
+        return self.uuid
+
+    def get(self):
+        """
+        If no pk exists for this transaction, see if we can find it
+        based on the uuid.
+        """
+        try:
+            trans = self.api.get_object_or_404(transaction_uuid=self.uuid)
+            self.pk = trans.pk
+        except ObjectDoesNotExist:
+            pass
+
+    def init(self, **kw):
+        """
+        Create an initial transaction with the *minimum* amount of data. If
+        status is not provided, its set to STATUS_STARTED
+        """
+        kw['status'] = kw.get('status', STATUS_STARTED)
+        trans = self.api.post(**kw)
+        self.pk = trans.pk
+
+    def update(self, **kw):
+        """
+        A shortcut to update the transaction with the values.
+        """
+        self.api(self.pk).patch(**kw)
+
+    def fail(self, reason):
+        """
+        A shortcut to fail the transaction and show a nice error.
+        """
+        self.update({'reason': reason, 'status': STATUS_ERRORED})
 
 
 if not settings.SOLITUDE_URL:
